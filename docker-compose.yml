@@ -1,0 +1,18 @@
+services:
+  upstream-service:
+    image: your/upstream-image:latest
+    container_name: upstream-service
+    restart: unless-stopped
+    expose:
+      - "8080"
+
+  decompressor:
+    image: ghcr.io/550w-host/decompressor:latest
+    container_name: decompressor
+    restart: unless-stopped
+    depends_on:
+      - upstream-service
+    env_file:
+      - ./.env
+    ports:
+      - "127.0.0.1:5505:5505"

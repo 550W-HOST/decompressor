@@ -1,9 +1,9 @@
-use std::env;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine as _;
+use decompressor::config::TestConfig;
 use dotenvy::dotenv;
 use libdeflater::{CompressionLvl, Compressor};
 use reqwest::blocking::Client;
@@ -12,12 +12,9 @@ use serde_json::{Value, json};
 
 fn load_config() -> (String, String, String) {
   dotenv().expect("failed to load .env file");
+  let config = TestConfig::from_env().expect("failed to load test config from .env");
 
-  let api_base = env::var("API_BASE").expect("missing API_BASE in .env");
-  let api_key = env::var("API_KEY").expect("missing API_KEY in .env");
-  let model = env::var("MODEL").expect("missing MODEL in .env");
-
-  (api_base, api_key, model)
+  (config.api_base, config.api_key, config.model)
 }
 
 fn build_client() -> Client {
