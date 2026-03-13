@@ -96,7 +96,7 @@ fn compare_gzip_bodies(
 fn raw_curl_for_gzip_body(body: &[u8]) -> String {
   let encoded = base64::engine::general_purpose::STANDARD.encode(body);
   format!(
-    "printf '%s' '{encoded}' | base64 -d | curl 'https://your-api.example.com/v1/chat/completions' -H 'Authorization: Bearer ${TEST_API_KEY:?set TEST_API_KEY}' -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' --data-binary @-"
+    "printf '%s' '{encoded}' | base64 -d | curl \"${{TEST_API_BASE:?set TEST_API_BASE}}/v1/chat/completions\" -H \"Authorization: Bearer ${{TEST_API_KEY:?set TEST_API_KEY}}\" -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' --data-binary @-"
   )
 }
 
