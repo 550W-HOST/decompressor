@@ -45,8 +45,9 @@ services:
     restart: unless-stopped
     depends_on:
       - upstream-service
-    env_file:
-      - ./.env
+    environment:
+      DECOMPRESSOR_LISTEN_ADDR: 0.0.0.0:5505
+      DECOMPRESSOR_UPSTREAM_URL: http://upstream-service:8080
     ports:
       - "127.0.0.1:5505:5505"
 ```
@@ -72,11 +73,17 @@ Request handling rules:
 
 - `Content-Encoding: gzip`: streamed through a gzip decoder, then forwarded upstream without the `Content-Encoding` header
 - no request compression: forwarded directly
+- the original `Host` header is preserved when forwarding to the upstream
+- `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host` are attached for the upstream
 - responses: streamed straight back to the client
 
 ## Environment Variables
 
-`decompressor` reads its runtime settings from environment variables. In local development and Docker Compose, the easiest way is to keep them in `.env`.
+`decompressor` reads its runtime settings from environment variables.
+
+In Docker Compose, the service definition passes the `DECOMPRESSOR_*` values directly with
+`environment:`.
+In local development and the external CPA tests, the easiest way is to keep values in `.env`.
 
 Example:
 

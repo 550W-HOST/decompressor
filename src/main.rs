@@ -1,5 +1,6 @@
 use decompressor::config::Config;
 use decompressor::proxy::{AppState, app};
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,7 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.listen_addr, config.upstream_url
   );
 
-  axum::serve(listener, app(state)).await?;
+  axum::serve(
+    listener,
+    app(state).into_make_service_with_connect_info::<SocketAddr>(),
+  )
+  .await?;
 
   Ok(())
 }

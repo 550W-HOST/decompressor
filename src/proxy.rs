@@ -1,10 +1,12 @@
+use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 
 use async_compression::tokio::bufread::GzipDecoder;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::header::{
   CONTENT_ENCODING, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue,
 };
@@ -15,6 +17,10 @@ use futures_util::TryStreamExt;
 use reqwest::Url;
 use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
+
+static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,6 +34,13 @@ impl AppState {
       .redirect(reqwest::redirect::Policy::none())
       .build()?;
 
+    Self::with_client(client, upstream_base_url)
+  }
+
+  pub fn with_client(
+    client: reqwest::Client,
+    upstream_base_url: Url,
+  ) -> Result<Self, reqwest::Error> {
     Ok(Self {
       client,
       upstream_base_url,
@@ -47,6 +60,7 @@ pub fn app(state: AppState) -> Router {
 
 async fn proxy_request(
   State(state): State<AppState>,
+  ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
   request: Request<Body>,
 ) -> Result<Response, ProxyError> {
   let (parts, body) = request.into_parts();
@@ -55,7 +69,7 @@ async fn proxy_request(
     reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).map_err(ProxyError::Method)?;
   let content_encoding = parse_request_content_encoding(&parts.headers)?;
   let upstream_body = request_body_for_upstream(body, content_encoding);
-  let upstream_headers = sanitize_request_headers(&parts.headers, content_encoding)?;
+  let upstream_headers = sanitize_request_headers(&parts.headers, content_encoding, client_addr)?;
 
   let upstream_response = state
     .client
@@ -109,23 +123,65 @@ fn parse_request_content_encoding(
 
 fn sanitize_request_headers(
   original_headers: &HeaderMap,
-  _content_encoding: RequestContentEncoding,
+  content_encoding: RequestContentEncoding,
+  client_addr: SocketAddr,
 ) -> Result<HeaderMap, ProxyError> {
   let mut headers = HeaderMap::new();
 
   for (name, value) in original_headers {
-    if is_hop_by_hop_header(name)
-      || name == HOST
-      || name == CONTENT_LENGTH
-      || name == CONTENT_ENCODING
-    {
+    if is_hop_by_hop_header(name) || name == CONTENT_LENGTH {
+      continue;
+    }
+
+    if content_encoding == RequestContentEncoding::Gzip && name == CONTENT_ENCODING {
       continue;
     }
 
     headers.append(name, clone_header_value(value)?);
   }
 
+  apply_forwarding_headers(&mut headers, original_headers, client_addr)?;
+
   Ok(headers)
+}
+
+fn apply_forwarding_headers(
+  headers: &mut HeaderMap,
+  original_headers: &HeaderMap,
+  client_addr: SocketAddr,
+) -> Result<(), ProxyError> {
+  let forwarded_for = append_csv_header_value(
+    headers.get(X_FORWARDED_FOR.clone()),
+    &client_addr.ip().to_string(),
+  )?;
+  headers.insert(X_FORWARDED_FOR.clone(), forwarded_for);
+
+  if !headers.contains_key(X_FORWARDED_PROTO.clone()) {
+    headers.insert(X_FORWARDED_PROTO.clone(), HeaderValue::from_static("http"));
+  }
+
+  if let Some(host) = original_headers.get(HOST) {
+    if !headers.contains_key(X_FORWARDED_HOST.clone()) {
+      headers.insert(X_FORWARDED_HOST.clone(), clone_header_value(host)?);
+    }
+  }
+
+  Ok(())
+}
+
+fn append_csv_header_value(
+  existing: Option<&HeaderValue>,
+  value: &str,
+) -> Result<HeaderValue, ProxyError> {
+  match existing {
+    Some(existing) => {
+      let existing = existing
+        .to_str()
+        .map_err(|_| ProxyError::InvalidForwardedHeaderValue("x-forwarded-for".to_owned()))?;
+      HeaderValue::from_str(&format!("{existing}, {value}")).map_err(ProxyError::HeaderValue)
+    }
+    None => HeaderValue::from_str(value).map_err(ProxyError::HeaderValue),
+  }
 }
 
 fn request_body_for_upstream(
@@ -189,6 +245,7 @@ fn is_hop_by_hop_header(header_name: &HeaderName) -> bool {
 #[derive(Debug)]
 pub enum ProxyError {
   HeaderValue(axum::http::header::InvalidHeaderValue),
+  InvalidForwardedHeaderValue(String),
   InvalidUpstreamUrl(String),
   Method(axum::http::method::InvalidMethod),
   UnsupportedContentEncoding(String),
@@ -197,12 +254,16 @@ pub enum ProxyError {
 
 impl IntoResponse for ProxyError {
   fn into_response(self) -> Response {
-    let status = match self {
+    let status = match &self {
       Self::UnsupportedContentEncoding(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+      Self::Upstream(error) if error.is_body() => StatusCode::BAD_REQUEST,
+      Self::Upstream(error) if is_invalid_request_stream_error(error) => StatusCode::BAD_REQUEST,
+      Self::Upstream(error) if error.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
       Self::Upstream(_) => StatusCode::BAD_GATEWAY,
-      Self::HeaderValue(_) | Self::InvalidUpstreamUrl(_) | Self::Method(_) => {
-        StatusCode::INTERNAL_SERVER_ERROR
-      }
+      Self::HeaderValue(_)
+      | Self::InvalidForwardedHeaderValue(_)
+      | Self::InvalidUpstreamUrl(_)
+      | Self::Method(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     (status, self.to_string()).into_response()
@@ -213,6 +274,9 @@ impl fmt::Display for ProxyError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::HeaderValue(error) => write!(f, "invalid header value: {error}"),
+      Self::InvalidForwardedHeaderValue(name) => {
+        write!(f, "invalid forwarded header value: {name}")
+      }
       Self::InvalidUpstreamUrl(error) => write!(f, "failed to build upstream URL: {error}"),
       Self::Method(error) => write!(f, "invalid request method: {error}"),
       Self::UnsupportedContentEncoding(value) => {
@@ -224,3 +288,22 @@ impl fmt::Display for ProxyError {
 }
 
 impl std::error::Error for ProxyError {}
+
+fn is_invalid_request_stream_error(error: &reqwest::Error) -> bool {
+  let mut source: Option<&(dyn StdError + 'static)> = error.source();
+
+  while let Some(current) = source {
+    if let Some(io_error) = current.downcast_ref::<io::Error>() {
+      if matches!(
+        io_error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+      ) {
+        return true;
+      }
+    }
+
+    source = current.source();
+  }
+
+  false
+}

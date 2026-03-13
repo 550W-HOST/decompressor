@@ -12,7 +12,8 @@ services:
     restart: unless-stopped
     depends_on:
       - upstream-service
-    env_file:
-      - ./.env
+    environment:
+      DECOMPRESSOR_LISTEN_ADDR: 0.0.0.0:5505
+      DECOMPRESSOR_UPSTREAM_URL: http://upstream-service:8080
     ports:
       - "127.0.0.1:5505:5505"
