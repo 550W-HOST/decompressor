@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 
-use async_compression::tokio::bufread::GzipDecoder;
+use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -52,6 +52,7 @@ impl AppState {
 enum RequestContentEncoding {
   Identity,
   Gzip,
+  Brotli,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -116,6 +117,8 @@ fn parse_request_content_encoding(
     Ok(RequestContentEncoding::Identity)
   } else if values.len() == 1 && values[0] == "gzip" {
     Ok(RequestContentEncoding::Gzip)
+  } else if values.len() == 1 && values[0] == "br" {
+    Ok(RequestContentEncoding::Brotli)
   } else {
     Err(ProxyError::UnsupportedContentEncoding(values.join(", ")))
   }
@@ -133,7 +136,11 @@ fn sanitize_request_headers(
       continue;
     }
 
-    if content_encoding == RequestContentEncoding::Gzip && name == CONTENT_ENCODING {
+    if matches!(
+      content_encoding,
+      RequestContentEncoding::Gzip | RequestContentEncoding::Brotli
+    ) && name == CONTENT_ENCODING
+    {
       continue;
     }
 
@@ -200,6 +207,16 @@ fn request_body_for_upstream(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
       let reader = StreamReader::new(input_stream);
       let decoder = GzipDecoder::new(BufReader::new(reader));
+      let output_stream = ReaderStream::new(decoder);
+
+      reqwest::Body::wrap_stream(output_stream)
+    }
+    RequestContentEncoding::Brotli => {
+      let input_stream = body
+        .into_data_stream()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+      let reader = StreamReader::new(input_stream);
+      let decoder = BrotliDecoder::new(BufReader::new(reader));
       let output_stream = ReaderStream::new(decoder);
 
       reqwest::Body::wrap_stream(output_stream)

@@ -4,9 +4,11 @@ use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
+use brotli::CompressorReader;
 use decompressor::proxy::{AppState, app};
 use libdeflater::{CompressionLvl, Compressor};
 use serde_json::{Value, json};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -120,6 +122,58 @@ async fn decompresses_gzip_request_bodies_before_forwarding() {
 }
 
 #[tokio::test]
+async fn decompresses_brotli_request_bodies_before_forwarding() {
+  let upstream = spawn_server(upstream_app()).await;
+  let proxy =
+    spawn_proxy(AppState::new(upstream.base_url.parse().expect("invalid upstream URL")).unwrap())
+      .await;
+
+  #[rustfmt::skip]
+  let request_body = json!({
+    "model": "gpt-5.2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  });
+
+  let brotli_body = brotli_json(&request_body);
+
+  let response = reqwest::Client::new()
+    .post(format!("{}/v1/chat/completions?foo=bar", proxy.base_url))
+    .header("x-proxy-test", "br")
+    .header(CONTENT_TYPE, "application/json")
+    .header(CONTENT_ENCODING, "br")
+    .body(brotli_body)
+    .send()
+    .await
+    .expect("brotli request to proxy failed");
+
+  assert_eq!(response.status(), StatusCode::CREATED);
+  assert_eq!(
+    response
+      .headers()
+      .get("x-upstream")
+      .expect("missing x-upstream header"),
+    "ok"
+  );
+
+  let body: Value = response.json().await.expect("invalid JSON from upstream");
+
+  assert_eq!(body["method"], "POST");
+  assert_eq!(body["path"], "/v1/chat/completions");
+  assert_eq!(body["query"], "foo=bar");
+  assert_eq!(body["content_encoding"], Value::Null);
+  assert_eq!(body["x_proxy_test"], "br");
+  assert_eq!(body["body"], request_body);
+
+  proxy.abort();
+  upstream.abort();
+}
+
+#[tokio::test]
 async fn passes_upstream_response_status_headers_and_body_through() {
   let upstream = spawn_server(upstream_app()).await;
   let proxy =
@@ -194,7 +248,7 @@ async fn rejects_unsupported_content_encoding() {
   let response = reqwest::Client::new()
     .post(format!("{}/unsupported-encoding", proxy.base_url))
     .header(CONTENT_TYPE, "application/json")
-    .header(CONTENT_ENCODING, "br")
+    .header(CONTENT_ENCODING, "deflate")
     .body("{}")
     .send()
     .await
@@ -364,6 +418,16 @@ fn gzip_json_with_libdeflater(value: &Value) -> Vec<u8> {
     .expect("failed to gzip request body");
   gzipped_body.truncate(compressed_len);
   gzipped_body
+}
+
+fn brotli_json(value: &Value) -> Vec<u8> {
+  let request_json = serde_json::to_vec(value).expect("failed to serialize request body");
+  let mut reader = CompressorReader::new(request_json.as_slice(), 4096, 11, 22);
+  let mut compressed = Vec::new();
+  reader
+    .read_to_end(&mut compressed)
+    .expect("failed to brotli-compress request body");
+  compressed
 }
 
 fn upstream_app() -> Router {
