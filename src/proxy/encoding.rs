@@ -2,13 +2,16 @@ use std::fmt;
 use std::io;
 
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
-use axum::body::Body;
+use axum::body::{Body, BodyDataStream, Bytes};
 use axum::http::header::{CONTENT_ENCODING, HeaderMap};
 use futures_util::TryStreamExt;
-use tokio::io::BufReader;
+use tokio::io::{AsyncRead, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use super::ProxyError;
+
+type EncodedBodyStream = futures_util::stream::MapErr<BodyDataStream, fn(axum::Error) -> io::Error>;
+type EncodedBodyReader = BufReader<StreamReader<EncodedBodyStream, Bytes>>;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum RequestContentEncoding {
@@ -66,27 +69,31 @@ pub(super) fn request_body_for_upstream(
     RequestContentEncoding::Identity => reqwest::Body::wrap_stream(
       body
         .into_data_stream()
-        .map_err(|error| io::Error::other(error.to_string())),
+        .map_err(identity_data_stream_error as fn(axum::Error) -> io::Error),
     ),
-    RequestContentEncoding::Gzip => {
-      let input_stream = body
-        .into_data_stream()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
-      let reader = StreamReader::new(input_stream);
-      let decoder = GzipDecoder::new(BufReader::new(reader));
-      let output_stream = ReaderStream::new(decoder);
-
-      reqwest::Body::wrap_stream(output_stream)
-    }
-    RequestContentEncoding::Brotli => {
-      let input_stream = body
-        .into_data_stream()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
-      let reader = StreamReader::new(input_stream);
-      let decoder = BrotliDecoder::new(BufReader::new(reader));
-      let output_stream = ReaderStream::new(decoder);
-
-      reqwest::Body::wrap_stream(output_stream)
-    }
+    RequestContentEncoding::Gzip => decoded_request_body(body, GzipDecoder::new),
+    RequestContentEncoding::Brotli => decoded_request_body(body, BrotliDecoder::new),
   }
+}
+
+fn decoded_request_body<D, F>(body: Body, decoder: F) -> reqwest::Body
+where
+  D: AsyncRead + Send + 'static,
+  F: FnOnce(EncodedBodyReader) -> D,
+{
+  let input_stream = body
+    .into_data_stream()
+    .map_err(invalid_data_stream_error as fn(axum::Error) -> io::Error);
+  let reader = BufReader::new(StreamReader::new(input_stream));
+  let output_stream = ReaderStream::new(decoder(reader));
+
+  reqwest::Body::wrap_stream(output_stream)
+}
+
+fn identity_data_stream_error(error: axum::Error) -> io::Error {
+  io::Error::other(error.to_string())
+}
+
+fn invalid_data_stream_error(error: axum::Error) -> io::Error {
+  io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
