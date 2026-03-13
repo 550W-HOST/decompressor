@@ -55,6 +55,18 @@ enum RequestContentEncoding {
   Brotli,
 }
 
+impl fmt::Display for RequestContentEncoding {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let value = match self {
+      Self::Identity => "identity",
+      Self::Gzip => "gzip",
+      Self::Brotli => "br",
+    };
+
+    f.write_str(value)
+  }
+}
+
 pub fn app(state: AppState) -> Router {
   Router::new().fallback(any(proxy_request)).with_state(state)
 }
@@ -69,6 +81,20 @@ async fn proxy_request(
   let method =
     reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).map_err(ProxyError::Method)?;
   let content_encoding = parse_request_content_encoding(&parts.headers)?;
+
+  if content_encoding != RequestContentEncoding::Identity {
+    println!(
+      "decompressing {} request body for {} {}",
+      content_encoding,
+      method,
+      parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/")
+    );
+  }
+
   let upstream_body = request_body_for_upstream(body, content_encoding);
   let upstream_headers = sanitize_request_headers(&parts.headers, content_encoding, client_addr)?;
 
